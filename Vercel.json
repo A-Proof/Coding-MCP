@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/mcp.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/health",
+      "dest": "api/mcp.py"
+    },
+    {
+      "src": "/message",
+      "dest": "api/mcp.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "api/mcp.py"
+    }
+  ]
+}
