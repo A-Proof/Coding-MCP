@@ -1,23 +1,9 @@
 {
   "version": 2,
-  "builds": [
+  "rewrites": [
     {
-      "src": "api/mcp.py",
-      "use": "@vercel/python"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/health",
-      "dest": "api/mcp.py"
-    },
-    {
-      "src": "/message",
-      "dest": "api/mcp.py"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "api/mcp.py"
+      "source": "/(.*)",
+      "destination": "/api/mcp"
     }
   ]
 }
