@@ -3,22 +3,11 @@
 Vercel Serverless Function for MCP Server
 """
 
-from http.server import BaseHTTPRequestHandler
 import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
-# MCP SDK imports
-from mcp.server import Server
-from mcp.types import (
-    Tool,
-    TextContent,
-)
-
-# Initialize server
-app = Server("ai-workspace")
 
 # Workspace directory - use /tmp for Vercel serverless
 WORKSPACE_DIR = Path("/tmp/workspace")
@@ -257,67 +246,250 @@ def execute_tool(name: str, arguments: dict) -> dict:
         return {"success": False, "error": f"Error: {str(e)}"}
 
 
-class handler(BaseHTTPRequestHandler):
-    def _send_response(self, status_code: int, data: dict):
-        """Helper to send JSON response"""
-        self.send_response(status_code)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        self.wfile.write(json.dumps(data, indent=2).encode())
+def handler(request):
+    """Main Vercel handler function with MCP SSE support"""
+    from urllib.parse import urlparse, parse_qs
     
-    def do_OPTIONS(self):
-        """Handle CORS preflight"""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+    # Get request details
+    method = request.get('method', 'GET')
+    path = request.get('path', '/')
+    query = request.get('queryStringParameters', {}) or {}
     
-    def do_GET(self):
-        """Handle GET requests"""
-        if self.path == "/" or self.path == "/health":
-            self._send_response(200, {
+    # Handle OPTIONS for CORS
+    if method == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Accept',
+            },
+            'body': ''
+        }
+    
+    # MCP SSE endpoint - this is what ChatGPT Apps connects to
+    if path == '/sse' or path == '/api/mcp/sse':
+        # SSE headers
+        headers = {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': '*',
+        }
+        
+        # Check if this is initialization or a message
+        body_str = request.get('body', '')
+        
+        # If no body, send initialization
+        if not body_str or body_str == '':
+            # MCP initialization response
+            init_message = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "ai-workspace",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+            
+            sse_response = f"event: message\ndata: {json.dumps(init_message)}\n\n"
+            
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': sse_response
+            }
+        
+        # Handle MCP messages
+        try:
+            if isinstance(body_str, str):
+                message = json.loads(body_str)
+            else:
+                message = body_str
+            
+            method_name = message.get('method', '')
+            
+            # Handle tools/list
+            if method_name == 'tools/list':
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": message.get('id'),
+                    "result": {
+                        "tools": get_tools()
+                    }
+                }
+            
+            # Handle tools/call
+            elif method_name == 'tools/call':
+                params = message.get('params', {})
+                tool_name = params.get('name')
+                arguments = params.get('arguments', {})
+                
+                result = execute_tool(tool_name, arguments)
+                
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": message.get('id'),
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(result)
+                            }
+                        ]
+                    }
+                }
+            
+            else:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": message.get('id'),
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {method_name}"
+                    }
+                }
+            
+            sse_response = f"event: message\ndata: {json.dumps(response)}\n\n"
+            
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': sse_response
+            }
+            
+        except Exception as e:
+            error_response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32603,
+                    "message": str(e)
+                }
+            }
+            sse_response = f"event: message\ndata: {json.dumps(error_response)}\n\n"
+            
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': sse_response
+            }
+    
+    # MCP discovery endpoint
+    if path == '/.well-known/mcp.json':
+        host = request.get('headers', {}).get('host', 'your-project.vercel.app')
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+            },
+            'body': json.dumps({
+                "mcpServers": {
+                    "ai-workspace": {
+                        "url": f"https://{host}/sse",
+                        "transport": "sse"
+                    }
+                }
+            })
+        }
+    
+    # Regular HTTP endpoints (for testing)
+    headers = {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+    }
+    
+    if method == 'GET':
+        if path == '/' or path == '/health':
+            response_data = {
                 "name": "AI Workspace MCP Server",
                 "version": "1.0.0",
                 "status": "running",
-                "transport": "HTTP",
+                "mcp_sse_endpoint": "/sse",
+                "discovery": "/.well-known/mcp.json",
                 "endpoints": {
                     "health": "/health",
                     "tools": "/tools",
-                    "execute": "/execute (POST)"
+                    "execute": "/execute (POST)",
+                    "mcp_sse": "/sse (for ChatGPT Apps)"
                 }
-            })
-        elif self.path == "/tools":
-            self._send_response(200, {
-                "tools": get_tools()
-            })
+            }
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': json.dumps(response_data)
+            }
+        
+        elif path == '/tools':
+            return {
+                'statusCode': 200,
+                'headers': headers,
+                'body': json.dumps({"tools": get_tools()})
+            }
+        
         else:
-            self._send_response(404, {"error": "Not found"})
+            return {
+                'statusCode': 404,
+                'headers': headers,
+                'body': json.dumps({"error": "Not found"})
+            }
     
-    def do_POST(self):
-        """Handle POST requests"""
-        if self.path == "/execute":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            
+    # Handle POST requests (legacy REST API)
+    elif method == 'POST':
+        if path == '/execute':
             try:
-                request_data = json.loads(body.decode())
+                body = request.get('body', '{}')
+                if isinstance(body, str):
+                    request_data = json.loads(body)
+                else:
+                    request_data = body
+                
                 tool_name = request_data.get("tool")
                 arguments = request_data.get("arguments", {})
                 
                 if not tool_name:
-                    self._send_response(400, {"error": "Missing 'tool' parameter"})
-                    return
+                    return {
+                        'statusCode': 400,
+                        'headers': headers,
+                        'body': json.dumps({"error": "Missing 'tool' parameter"})
+                    }
                 
                 result = execute_tool(tool_name, arguments)
-                self._send_response(200, result)
+                return {
+                    'statusCode': 200,
+                    'headers': headers,
+                    'body': json.dumps(result)
+                }
                 
             except json.JSONDecodeError:
-                self._send_response(400, {"error": "Invalid JSON"})
+                return {
+                    'statusCode': 400,
+                    'headers': headers,
+                    'body': json.dumps({"error": "Invalid JSON"})
+                }
             except Exception as e:
-                self._send_response(500, {"error": str(e)})
+                return {
+                    'statusCode': 500,
+                    'headers': headers,
+                    'body': json.dumps({"error": str(e)})
+                }
         else:
-            self._send_response(404, {"error": "Not found"})
+            return {
+                'statusCode': 404,
+                'headers': headers,
+                'body': json.dumps({"error": "Not found"})
+            }
+    
+    else:
+        return {
+            'statusCode': 405,
+            'headers': headers,
+            'body': json.dumps({"error": "Method not allowed"})
+        }
