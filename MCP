@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+Vercel Serverless Function for MCP Server
+"""
+
+from http.server import BaseHTTPRequestHandler
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+# MCP SDK imports
+from mcp.server import Server
+from mcp.types import (
+    Tool,
+    TextContent,
+)
+
+# Initialize server
+app = Server("ai-workspace")
+
+# Workspace directory - use /tmp for Vercel serverless
+WORKSPACE_DIR = Path("/tmp/workspace")
+WORKSPACE_DIR.mkdir(exist_ok=True)
+
+
+def get_safe_path(filepath: str) -> Path:
+    """Ensure path is within workspace directory"""
+    requested_path = WORKSPACE_DIR / filepath
+    resolved_path = requested_path.resolve()
+    
+    if not str(resolved_path).startswith(str(WORKSPACE_DIR.resolve())):
+        raise ValueError("Path must be within workspace directory")
+    
+    return resolved_path
+
+
+def get_tools() -> list[dict]:
+    """Return list of available tools"""
+    return [
+        {
+            "name": "create_file",
+            "description": "Create a new file with content in the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the file relative to workspace",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Content to write to the file",
+                    },
+                },
+                "required": ["filepath", "content"],
+            },
+        },
+        {
+            "name": "read_file",
+            "description": "Read the contents of a file from the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the file relative to workspace",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        },
+        {
+            "name": "update_file",
+            "description": "Update an existing file's content in the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the file relative to workspace",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "New content for the file",
+                    },
+                },
+                "required": ["filepath", "content"],
+            },
+        },
+        {
+            "name": "delete_file",
+            "description": "Delete a file from the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the file relative to workspace",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        },
+        {
+            "name": "list_files",
+            "description": "List all files in the workspace or a specific directory",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Directory path relative to workspace (empty for root)",
+                        "default": "",
+                    },
+                },
+            },
+        },
+        {
+            "name": "execute_python",
+            "description": "Execute a Python script from the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path to the Python script relative to workspace",
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Command line arguments to pass to the script",
+                        "default": [],
+                    },
+                },
+                "required": ["filepath"],
+            },
+        },
+        {
+            "name": "create_directory",
+            "description": "Create a new directory in the workspace",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "dirpath": {
+                        "type": "string",
+                        "description": "Path to the directory relative to workspace",
+                    },
+                },
+                "required": ["dirpath"],
+            },
+        },
+    ]
+
+
+def execute_tool(name: str, arguments: dict) -> dict:
+    """Execute a tool and return the result"""
+    try:
+        if name == "create_file":
+            filepath = get_safe_path(arguments["filepath"])
+            content = arguments["content"]
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(content, encoding="utf-8")
+            return {
+                "success": True,
+                "message": f"Successfully created file: {arguments['filepath']}\nSize: {len(content)} bytes"
+            }
+        
+        elif name == "read_file":
+            filepath = get_safe_path(arguments["filepath"])
+            if not filepath.exists():
+                return {"success": False, "error": f"File not found: {arguments['filepath']}"}
+            content = filepath.read_text(encoding="utf-8")
+            return {
+                "success": True,
+                "content": content,
+                "filepath": arguments['filepath']
+            }
+        
+        elif name == "update_file":
+            filepath = get_safe_path(arguments["filepath"])
+            content = arguments["content"]
+            if not filepath.exists():
+                return {"success": False, "error": f"File not found: {arguments['filepath']}"}
+            filepath.write_text(content, encoding="utf-8")
+            return {
+                "success": True,
+                "message": f"Successfully updated file: {arguments['filepath']}\nNew size: {len(content)} bytes"
+            }
+        
+        elif name == "delete_file":
+            filepath = get_safe_path(arguments["filepath"])
+            if not filepath.exists():
+                return {"success": False, "error": f"File not found: {arguments['filepath']}"}
+            filepath.unlink()
+            return {"success": True, "message": f"Successfully deleted file: {arguments['filepath']}"}
+        
+        elif name == "list_files":
+            directory = arguments.get("directory", "")
+            dirpath = get_safe_path(directory) if directory else WORKSPACE_DIR
+            if not dirpath.exists():
+                return {"success": False, "error": f"Directory not found: {directory}"}
+            
+            files = []
+            dirs = []
+            
+            for item in sorted(dirpath.iterdir()):
+                rel_path = str(item.relative_to(WORKSPACE_DIR))
+                if item.is_file():
+                    files.append({"name": rel_path, "size": item.stat().st_size, "type": "file"})
+                else:
+                    dirs.append({"name": rel_path, "type": "directory"})
+            
+            return {"success": True, "directories": dirs, "files": files}
+        
+        elif name == "execute_python":
+            filepath = get_safe_path(arguments["filepath"])
+            args = arguments.get("args", [])
+            
+            if not filepath.exists():
+                return {"success": False, "error": f"Script not found: {arguments['filepath']}"}
+            if not filepath.suffix == ".py":
+                return {"success": False, "error": "File must be a Python script (.py)"}
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(filepath)] + args,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=str(WORKSPACE_DIR),
+                )
+                
+                return {
+                    "success": True,
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+            except subprocess.TimeoutExpired:
+                return {"success": False, "error": "Script execution timed out after 30 seconds"}
+            except Exception as e:
+                return {"success": False, "error": f"Error executing script: {str(e)}"}
+        
+        elif name == "create_directory":
+            dirpath = get_safe_path(arguments["dirpath"])
+            dirpath.mkdir(parents=True, exist_ok=True)
+            return {"success": True, "message": f"Successfully created directory: {arguments['dirpath']}"}
+        
+        else:
+            return {"success": False, "error": f"Unknown tool: {name}"}
+    
+    except ValueError as e:
+        return {"success": False, "error": f"Security error: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "error": f"Error: {str(e)}"}
+
+
+class handler(BaseHTTPRequestHandler):
+    def _send_response(self, status_code: int, data: dict):
+        """Helper to send JSON response"""
+        self.send_response(status_code)
+        self.send_header("Content-type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode())
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight"""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        if self.path == "/" or self.path == "/health":
+            self._send_response(200, {
+                "name": "AI Workspace MCP Server",
+                "version": "1.0.0",
+                "status": "running",
+                "transport": "HTTP",
+                "endpoints": {
+                    "health": "/health",
+                    "tools": "/tools",
+                    "execute": "/execute (POST)"
+                }
+            })
+        elif self.path == "/tools":
+            self._send_response(200, {
+                "tools": get_tools()
+            })
+        else:
+            self._send_response(404, {"error": "Not found"})
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        if self.path == "/execute":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            
+            try:
+                request_data = json.loads(body.decode())
+                tool_name = request_data.get("tool")
+                arguments = request_data.get("arguments", {})
+                
+                if not tool_name:
+                    self._send_response(400, {"error": "Missing 'tool' parameter"})
+                    return
+                
+                result = execute_tool(tool_name, arguments)
+                self._send_response(200, result)
+                
+            except json.JSONDecodeError:
+                self._send_response(400, {"error": "Invalid JSON"})
+            except Exception as e:
+                self._send_response(500, {"error": str(e)})
+        else:
+            self._send_response(404, {"error": "Not found"})
