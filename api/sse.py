@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler
 
 # Workspace directory
 WORKSPACE_DIR = Path("/tmp/workspace")
@@ -201,32 +202,31 @@ def execute_tool(name: str, arguments: dict) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def handler(request):
+from http.server import BaseHTTPRequestHandler
+
+
+class handler(BaseHTTPRequestHandler):
     """Vercel handler for SSE endpoint"""
     
-    method = request.get('method', 'GET')
+    def do_OPTIONS(self):
+        """Handle CORS preflight"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization')
+        self.end_headers()
     
-    # SSE headers
-    sse_headers = {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
-        'X-Accel-Buffering': 'no',
-    }
-    
-    # Handle CORS preflight
-    if method == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': sse_headers,
-            'body': ''
-        }
-    
-    # Handle GET - initial connection
-    if method == 'GET':
+    def do_GET(self):
+        """Handle GET - initial SSE connection"""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-transform')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+        
+        # MCP initialization message
         init_message = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -241,23 +241,23 @@ def handler(request):
         }
         
         sse_data = f"event: message\ndata: {json.dumps(init_message)}\n\n"
-        
-        return {
-            'statusCode': 200,
-            'headers': sse_headers,
-            'body': sse_data
-        }
+        self.wfile.write(sse_data.encode('utf-8'))
     
-    # Handle POST - MCP messages
-    if method == 'POST':
+    def do_POST(self):
+        """Handle POST - MCP messages"""
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-transform')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+        
         try:
-            body_str = request.get('body', '')
-            
-            if isinstance(body_str, str):
-                message = json.loads(body_str) if body_str else {}
-            else:
-                message = body_str
-            
+            message = json.loads(body) if body else {}
             method_name = message.get('method', '')
             msg_id = message.get('id', 1)
             
@@ -312,12 +312,7 @@ def handler(request):
                 }
             
             sse_data = f"event: message\ndata: {json.dumps(response)}\n\n"
-            
-            return {
-                'statusCode': 200,
-                'headers': sse_headers,
-                'body': sse_data
-            }
+            self.wfile.write(sse_data.encode('utf-8'))
             
         except Exception as e:
             error_response = {
@@ -326,16 +321,4 @@ def handler(request):
                 "error": {"code": -32603, "message": str(e)}
             }
             sse_data = f"event: message\ndata: {json.dumps(error_response)}\n\n"
-            
-            return {
-                'statusCode': 200,
-                'headers': sse_headers,
-                'body': sse_data
-            }
-    
-    # Unsupported method
-    return {
-        'statusCode': 405,
-        'headers': sse_headers,
-        'body': 'event: error\ndata: {"error": "Method not allowed"}\n\n'
-    }
+            self.wfile.write(sse_data.encode('utf-8'))
